@@ -25,5 +25,5 @@ struct IpHdr final
     Ip sip() { return ntohl(sip_); }
     Ip tip() { return ntohl(tip_); }
 };
-typedef EthHdr *PEthHdr;
+typedef IpHdr *PIpHdr;
 #pragma pack(pop)
